@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+import socket
+from time import strftime
+import threading
+import argparse
+import sys
+from pathlib import Path
+
+class TCPServer:
+
+    def __init__(self, host, port):
+        self.Banner = "default"
+        self.logpath = Path("/var/log") / "honeytrap.log"
+        self.host = host
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.lock = threading.Lock()
+
+
+    def bind(self):
+        self.sock.bind((self.host, self.port))
+
+    def listen(self):
+        self.sock.listen()
+
+    def accept(self):
+        return self.sock.accept()
+
+    def save(self, data):
+        with self.lock:
+            try:
+                with open(self.logpath, "r") as f:
+                    lines = f.readlines()
+                    if len(lines) >= 10:
+                        lines = lines[1:]  
+            except FileNotFoundError:
+                lines = []
+            finally:
+                with open(self.logpath, "w") as f:
+                    f.writelines(lines)
+                    f.write(f"{strftime('%Y-%m-%d %H:%M:%S')} - {data}\n")
+
+    def handle_connection(self, conn, addr):
+        banner = self.Banner
+        conn.sendall(banner.encode())
+        data = conn.recv(1024)
+        try:
+            decode_data = data.decode()
+        except UnicodeDecodeError:
+            decode_data = data.decode('utf-8', errors='replace')
+        finally:
+            conn.close()
+        self.save(f"Connection from {addr} - Data: {decode_data}")
+
+    def connection_acceptor(self):
+        while True:
+            conn, addr = self.accept()
+            thread = threading.Thread(target=self.handle_connection, args=(conn, addr))
+            thread.start()
+
+class SSHHoneypot(TCPServer):
+    def __init__(self, host, port):
+        super().__init__(host, port)
+        self.Banner = "SSH-2.0-OpenSSH_9.6\n"
+
+class HTTPHoneypot(TCPServer):
+    def __init__(self, host, port):
+        super().__init__(host, port)
+        self.Banner = "HTTP/1.1 401 Unauthorized\r\nServer: Apache/2.4.58\r\nWWW-Authenticate: Basic realm=\"Restricted\"\r\n\r\n"
+
+class FTPHoneypot(TCPServer):
+    def __init__(self, host, port):
+        super().__init__(host, port)
+        self.Banner = "220 (vsFTPd 3.0.5)\r\n"
+
+
+def main(args):
+    try:
+        services = {
+            "ssh":  SSHHoneypot,
+            "http": HTTPHoneypot,
+            "ftp":  FTPHoneypot,
+        }
+        if args.service not in services:
+            print(f"unknown service: {args.service}")
+            sys.exit(1)
+        cls = services[args.service]         
+        server = cls(args.host, args.port)    
+        server.bind()
+        server.listen()
+        server.connection_acceptor()
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(0)
+    except KeyboardInterrupt:
+        print("Server shutting down.")
+        server.sock.close()
+        sys.exit()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="honeytrap",
+        description="TCP honeypot - serves a fake service banner and logs who connects.",
+        epilog="Example: sudo honeytrap -s http -p 8080 -H 0.0.0.0",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-s", "--service",
+        default="ssh",
+        choices=["ssh", "http", "ftp"],
+        help="which fake service banner to present",
+    )
+    parser.add_argument(
+        "-p", "--port",
+        type=int,
+        default=8080,
+        help="TCP port to listen on",
+    )
+    parser.add_argument(
+        "-H", "--host",
+        default="0.0.0.0",
+        help="address to bind (0.0.0.0 = all interfaces)",
+    )
+    args = parser.parse_args()
+    main(args)
